@@ -104,3 +104,7 @@ Primary files: `src/lib/learning.ts`, `src/lib/service.ts`, course/review/settin
 ## Next acceptance step
 
 Configure an actual Supabase development project and OpenAI key following `README.md`; execute the migration, two-account isolation/deletion checks, real-model smoke tests and browser cases. Resolve those observations before treating P0 as production-ready. No permission or credential values are embedded in the source deliverable.
+
+## Sign-in delivery diagnostics follow-up
+
+Email sign-in now distinguishes provider rate limits, restricted recipients and disabled email providers. Other delivery failures direct the operator to Supabase Auth/SMTP logs. Vercel logs contain only a request ID, bounded provider error code and numeric status; provider messages, addresses and credentials are never logged. Rate limits return HTTP 429. Three regression tests cover these cases (22 unit/domain/model tests in total). Live SMTP remains unverified.

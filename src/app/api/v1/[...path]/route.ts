@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { identity, supabase, devAuth, mockModel } from "@/lib/auth";
 import { command, view, exportState } from "@/lib/service";
+import { signInError, signInDiagnostic } from "@/lib/sign-in-error";
 export const runtime = "nodejs";
 function error(e: unknown, requestId: string) {
   const status =
@@ -12,7 +13,8 @@ function error(e: unknown, requestId: string) {
     {
       error: {
         code:
-          status === 401
+          (e as { code?: string })?.code ||
+          (status === 401
             ? "UNAUTHORIZED"
             : status === 409
               ? "CONFLICT"
@@ -22,14 +24,14 @@ function error(e: unknown, requestId: string) {
                   ? "MODEL_UNAVAILABLE"
                   : status === 400
                     ? "VALIDATION"
-                    : "REQUEST_FAILED",
+                    : "REQUEST_FAILED"),
         message:
           status === 500
             ? "Unable to complete this request. Check configuration and retry."
             : e instanceof Error
               ? e.message
               : "Request failed.",
-        retryable: status >= 500 || status === 409,
+        retryable: status >= 500 || status === 409 || status === 429,
       },
       requestId,
     },
@@ -80,11 +82,10 @@ export async function POST(req: NextRequest) {
         email,
         options: { emailRedirectTo: expected + "/auth/callback" },
       });
-      if (e)
-        throw Object.assign(
-          new Error("Unable to send sign-in email. Please retry shortly."),
-          { status: 503 },
-        );
+      if (e) {
+        console.error(JSON.stringify(signInDiagnostic(e, requestId)));
+        throw signInError(e);
+      }
       return NextResponse.json({ ok: true });
     }
     const user = await identity();
