@@ -206,3 +206,96 @@ describe("durable learning service", () => {
     expect((await view(user)).courses[0].evidence).toHaveLength(1);
   });
 });
+
+describe("guest course limits", () => {
+  it("allows a complete first course, retries, and continued learning", async () => {
+    const user = owner();
+    const key = crypto.randomUUID();
+    const draft = await command(
+      user,
+      { action: "createDraft", text: "Guest topic", key },
+      true,
+    );
+    expect(
+      (
+        await command(
+          user,
+          { action: "createDraft", text: "Guest topic", key },
+          true,
+        )
+      ).resource,
+    ).toBe(draft.resource);
+    await command(
+      user,
+      {
+        action: "answerDraft",
+        resource: draft.resource,
+        text: "Start now",
+        version: 0,
+      },
+      true,
+    );
+    const first = await command(
+      user,
+      { action: "convert", resource: draft.resource },
+      true,
+    );
+    expect(
+      (
+        await command(
+          user,
+          { action: "convert", resource: draft.resource },
+          true,
+        )
+      ).resource,
+    ).toBe(first.resource);
+    await command(user, { action: "session", resource: first.resource }, true);
+    const current = (await view(user)).courses[0];
+    await command(
+      user,
+      {
+        action: "saveAnswer",
+        resource: first.resource,
+        activityId: current.activities[0].id,
+        text: "a",
+        version: 0,
+      },
+      true,
+    );
+    expect((await view(user)).courses[0].activities[0].answer).toBe("a");
+    await expect(
+      command(user, { action: "createDraft", text: "Second topic" }, true),
+    ).rejects.toMatchObject({ status: 403, code: "ACCOUNT_REQUIRED" });
+    await expect(
+      command(user, { action: "delete", resource: first.resource }, true),
+    ).rejects.toMatchObject({ code: "ACCOUNT_REQUIRED" });
+    // Email upgrade keeps the same owner and removes the guest restriction.
+    await command(user, { action: "createDraft", text: "Second topic" }, false);
+    expect((await view(user)).courses[0].activities[0].answer).toBe("a");
+  });
+  it("blocks a second draft before conversion and does not spend AI budget", async () => {
+    const user = owner();
+    await command(user, { action: "createDraft", text: "First" }, true);
+    const before = await readState(user);
+    await expect(
+      command(user, { action: "createDraft", text: "Second" }, true),
+    ).rejects.toMatchObject({ code: "ACCOUNT_REQUIRED" });
+    expect((await readState(user)).data.budget).toEqual(before.data.budget);
+  });
+  it("blocks conversion of a second pre-existing draft", async () => {
+    const user = owner();
+    const first = await send(user, { action: "createDraft", text: "First" });
+    const second = await send(user, { action: "createDraft", text: "Second" });
+    for (const d of [first, second])
+      await send(user, {
+        action: "answerDraft",
+        resource: d.resource,
+        text: "Start now",
+        version: 0,
+      });
+    await command(user, { action: "convert", resource: first.resource }, true);
+    await expect(
+      command(user, { action: "convert", resource: second.resource }, true),
+    ).rejects.toMatchObject({ code: "ACCOUNT_REQUIRED" });
+  });
+});

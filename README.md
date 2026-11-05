@@ -37,6 +37,16 @@ To try **real AI with local persistence**, use `ADA_DEV_AUTH=true`, `MOCK_MODEL=
 
 All database records sit in a versioned learner aggregate. RLS is enabled; **anon and authenticated roles have no table access** because the aggregate contains private grading keys. Only the server service role can read it. The server derives the owner ID from verified authentication and scopes every query to it. The compare-and-swap RPC is executable only by the service role. The authenticated self-deletion function uses `auth.uid()` and takes no target user ID. See `DECISIONS.md` for the storage tradeoff.
 
+## Guest-first learning
+
+Visitors can open the app and begin one course without entering an email. The first command creates a Supabase anonymous session; ordinary page views create no user records. Guests can complete activities, with temporary progress tied to that browser session. “Save progress” and attempting another course open the email account dialog. A verified email upgrade retains the same Supabase user ID and learner state.
+
+Enable **Allow anonymous sign-ins** and **Allow manual linking** in Supabase Authentication before using this flow. Keep email confirmation enabled. Add `http://localhost:3001/auth/callback` to allowed redirect URLs for this local checkout. No database migration is required: anonymous users use the existing server-only learner-state storage. Configure Supabase anonymous signup rate limits for public deployment.
+
+The one-course limit is enforced server-side, including draft creation and duplicate conversions. Signing into an existing account is a separate, explicit option; guest courses are not merged into existing accounts. The dialog explains this before sign-in. Clearing cookies or signing out can lose access to an unclaimed guest course.
+
+Guest limits, session handling, and email-link routing have automated coverage with mocked authentication. Live anonymous signup, real AI course creation, Supabase persistence, and the second-course restriction were verified against the configured project on November 5, 2026 using a disposable test guest, which was removed afterward. Guest-to-email confirmation still needs an end-to-end check.
+
 ## What works
 
 - Empty course-first sidebar and responsive home prompt; desktop sidebar/mobile drawer.

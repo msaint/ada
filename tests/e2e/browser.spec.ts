@@ -53,3 +53,48 @@ test("goal: mobile course drawer and assisted evidence", async ({ page }) => {
   await page.getByRole("link", { name: "Progress", exact: true }).click();
   await expect(page.getByText("Assisted · correct")).toBeVisible();
 });
+
+test("answer autosave stays quiet and submission waits for it", async ({
+  page,
+}) => {
+  await createCourse(page, "Quiet answer saving");
+  let releaseSave!: () => void;
+  const holdSave = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  let saving!: () => void;
+  const saveStarted = new Promise<void>((resolve) => {
+    saving = resolve;
+  });
+  let submittedAnswer: string | undefined;
+  await page.route("**/api/v1/command", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.action === "saveAnswer") {
+      saving();
+      await holdSave;
+    }
+    if (body.action === "attempt") submittedAnswer = body.text;
+    await route.continue();
+  });
+  try {
+    const choices = page.getByRole("radio");
+    await choices.first().check();
+    await saveStarted;
+    await expect(choices.nth(1)).toBeEnabled();
+    const submit = page.getByRole("button", {
+      name: "Check answer",
+      exact: true,
+    });
+    await expect(submit).toBeEnabled();
+    await choices.nth(1).check();
+    const selected = await choices.nth(1).inputValue();
+    await submit.click();
+    releaseSave();
+    await expect(
+      page.getByRole("button", { name: "Continue", exact: true }),
+    ).toBeVisible();
+    expect(submittedAnswer).toBe(selected);
+  } finally {
+    releaseSave();
+  }
+});

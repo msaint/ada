@@ -1,5 +1,5 @@
 import { test, expect, type APIRequestContext } from "@playwright/test";
-const origin = "http://localhost:3000";
+const origin = `http://localhost:${process.env.ADA_TEST_PORT || 3000}`;
 async function command(
   request: APIRequestContext,
   action: string,

@@ -48,9 +48,33 @@ export async function view(owner: string) {
   const s = await readState(owner);
   return publicState(s.data);
 }
-export async function command(owner: string, input: Command) {
+export async function command(owner: string, input: Command, guest = false) {
   const cmd = commandSchema.parse(input);
   let snapshot = await readState(owner);
+  const requireAccount = () => {
+    throw Object.assign(
+      new Error(
+        "Create an account to save your progress and add more courses.",
+      ),
+      { status: 403, code: "ACCOUNT_REQUIRED" },
+    );
+  };
+  const checkGuest = () => {
+    if (!guest) return;
+    const s = snapshot.data;
+    if (cmd.action === "createDraft" && (s.drafts.length || s.courses.length)) {
+      if (cmd.key && s.keys[cmd.key]) return;
+      requireAccount();
+    }
+    if (
+      cmd.action === "convert" &&
+      s.courses.length &&
+      !s.drafts.find((d) => d.id === cmd.resource)?.courseId
+    )
+      requireAccount();
+    if (["delete", "preferences"].includes(cmd.action)) requireAccount();
+  };
+  checkGuest();
   const aiActions = [
     "createDraft",
     "answerDraft",
@@ -67,6 +91,7 @@ export async function command(owner: string, input: Command) {
   if (aiActions.includes(cmd.action)) {
     await reserveBudget(owner);
     snapshot = await readState(owner);
+    checkGuest();
   }
   const s = snapshot.data;
   let resource = cmd.resource;

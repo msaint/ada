@@ -60,8 +60,11 @@ async function api(url: string, body?: unknown) {
   });
   const data = await r.json();
   if (!r.ok)
-    throw new Error(
-      data.error?.message || "Something went wrong. Please try again.",
+    throw Object.assign(
+      new Error(
+        data.error?.message || "Something went wrong. Please try again.",
+      ),
+      { code: data.error?.code },
     );
   return data;
 }
@@ -71,7 +74,11 @@ export default function Ada() {
     params = useSearchParams();
   const [state, setState] = useState<PublicState>(empty),
     [loading, setLoading] = useState(true),
-    [loggedIn, setLoggedIn] = useState(false),
+    [guest, setGuest] = useState(true),
+    [accountDialog, setAccountDialog] = useState(
+      pathname === "/login" || params.has("error"),
+    ),
+    [signingIn, setSigningIn] = useState(pathname === "/login"),
     [email, setEmail] = useState(""),
     [sent, setSent] = useState(false),
     [busy, setBusy] = useState(false),
@@ -90,10 +97,16 @@ export default function Ada() {
     [deleting, setDeleting] = useState(false),
     [displayName, setDisplayName] = useState(""),
     [timezone, setTimezone] = useState("UTC");
-  const pending = useRef(false),
+  const requestQueue = useRef<Promise<void>>(Promise.resolve()),
+    latestState = useRef<PublicState>(empty),
+    answerRevision = useRef(0),
     answerDirty = useRef(false),
     saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
     retryKey = useRef<{ signature: string; key: string } | null>(null);
+  function applyState(next: PublicState) {
+    latestState.current = next;
+    setState(next);
+  }
   const courseId = pathname.split("/")[3],
     course = state.courses.find((c) => c.id === courseId),
     draft = state.drafts.find((d) => d.id === params.get("draft"));
@@ -109,13 +122,13 @@ export default function Ada() {
   useEffect(() => {
     api("state")
       .then((data) => {
-        setState(data.state);
+        applyState(data.state);
         setMode(data.mode);
-        setLoggedIn(true);
+        setGuest(!data.user || data.user.guest);
         setDisplayName(data.state.preferences.displayName);
         setTimezone(data.state.preferences.timezone);
       })
-      .catch(() => setLoggedIn(false))
+      .catch(() => setError("Unable to connect. Please refresh to try again."))
       .finally(() => setLoading(false));
   }, []);
   if (activity?.id !== observedActivityId) {
@@ -135,6 +148,7 @@ export default function Ada() {
         setMenu(false);
         setGoalEdit(false);
         setDeleting(false);
+        setAccountDialog(false);
       }
     };
     window.addEventListener("keydown", handler);
@@ -148,7 +162,7 @@ export default function Ada() {
     }
   }, [activity?.id]);
   useEffect(() => {
-    if (!goalEdit && !deleting) return;
+    if (!goalEdit && !deleting && !accountDialog) return;
     const previous = document.activeElement as HTMLElement | null;
     const dialog = document.querySelector<HTMLElement>(
       '[role="dialog"],[role="alertdialog"]',
@@ -178,7 +192,7 @@ export default function Ada() {
       document.removeEventListener("keydown", trap);
       previous?.focus();
     };
-  }, [goalEdit, deleting]);
+  }, [goalEdit, deleting, accountDialog]);
   async function run(cmd: Command): Promise<ApiResult | undefined> {
     if (
       [
@@ -192,19 +206,34 @@ export default function Ada() {
       ].includes(cmd.action)
     )
       cmd = { ...cmd, activityId: activity?.id };
-    if (pending.current) return;
-    pending.current = true;
-    setBusy(true);
-    setError("");
-    const signature = JSON.stringify(cmd);
-    if (!retryKey.current || retryKey.current.signature !== signature)
-      retryKey.current = { signature, key: crypto.randomUUID() };
+    const background = cmd.action === "saveAnswer";
+    if (!background) setBusy(true);
+    const previous = requestQueue.current;
+    let release!: () => void;
+    requestQueue.current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
     try {
+      if (background) {
+        const currentCourse = latestState.current.courses.find(
+          (c) => c.id === cmd.resource,
+        );
+        const current = currentCourse?.activities[currentCourse.current];
+        // A queued save must not overwrite a submitted or different activity.
+        if (!current || current.id !== cmd.activityId || current.feedback)
+          return;
+        cmd = { ...cmd, version: current.answerVersion };
+      }
+      setError("");
+      const signature = JSON.stringify(cmd);
+      if (!retryKey.current || retryKey.current.signature !== signature)
+        retryKey.current = { signature, key: crypto.randomUUID() };
       const data = await api("command", {
         ...cmd,
         key: cmd.key || retryKey.current.key,
       });
-      setState(data.state);
+      applyState(data.state);
       if (cmd.action === "delete") {
         const removed = state.courses.find((c) => c.id === cmd.resource);
         try {
@@ -217,14 +246,16 @@ export default function Ada() {
       retryKey.current = null;
       return data;
     } catch (e) {
+      if ((e as { code?: string }).code === "ACCOUNT_REQUIRED")
+        setAccountDialog(true);
       setError(e instanceof Error ? e.message : "Please retry.");
       try {
         const saved = await api("state");
-        setState(saved.state);
+        applyState(saved.state);
       } catch {}
     } finally {
-      pending.current = false;
-      setBusy(false);
+      release();
+      if (!background) setBusy(false);
     }
   }
   async function navigate(url: string) {
@@ -248,19 +279,21 @@ export default function Ada() {
   async function save() {
     if (!course || !activity || activity.feedback || !answerDirty.current)
       return true;
+    const revision = answerRevision.current;
     const result = await run({
       action: "saveAnswer",
       resource: course.id,
       text: answer,
       version: activity.answerVersion,
     });
-    if (result) {
+    if (result && answerRevision.current === revision) {
       answerDirty.current = false;
       return true;
     }
     return false;
   }
   function updateAnswer(text: string) {
+    const revision = ++answerRevision.current;
     setAnswer(text);
     try {
       if (activity)
@@ -272,14 +305,14 @@ export default function Ada() {
     answerDirty.current = true;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      if (pending.current) return;
       const data = await run({
         action: "saveAnswer",
         resource: course?.id,
         text,
         version: activity?.answerVersion,
       });
-      if (data) answerDirty.current = false;
+      if (data && answerRevision.current === revision)
+        answerDirty.current = false;
     }, 700);
   }
   async function activityAction(action: Command["action"]) {
@@ -304,6 +337,10 @@ export default function Ada() {
   }
   async function startTopic(e: React.FormEvent) {
     e.preventDefault();
+    if (guest && (state.courses.length || state.drafts.length)) {
+      setAccountDialog(true);
+      return;
+    }
     const data = await run({ action: "createDraft", text: input });
     if (data) navigate("/app/new?draft=" + data.resource);
   }
@@ -329,71 +366,94 @@ export default function Ada() {
         <p>Making room for curiosity…</p>
       </div>
     );
-  if (!loggedIn)
-    return (
-      <main className="login">
-        <Link className="brand" href="/app">
-          <span className="brand-mark">a</span>Ada
-          <span className="beta">EARLY ACCESS</span>
-        </Link>
-        <div className="login-inner">
-          <span className="eyebrow">A LITTLE CURIOSITY GOES A LONG WAY</span>
-          <h1>
-            Your next
-            <br />
-            “oh, I get it.”
-          </h1>
-          <p>
-            A course for whatever’s on your mind.
-            <br />A coach to help it make sense.
-          </p>
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              setBusy(true);
-              setError("");
-              try {
-                await api("login", { email });
-                setSent(true);
-              } catch (e) {
-                setError((e as Error).message);
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
-            <label htmlFor="email">Your email</label>
-            <input
-              id="email"
-              type="email"
-              required
-              value={email}
-              placeholder="you@example.com"
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            <button className="primary" disabled={busy}>
-              {busy ? "Sending…" : "Continue with email"}
-              <ArrowRight size={17} />
-            </button>
-          </form>
-          {sent && (
-            <p role="status">Check your email for a secure sign-in link.</p>
-          )}
-          {error && (
-            <p className="error" role="alert">
-              {error}
-            </p>
-          )}
-          <small>
-            Lessons are generated and assessed using third-party AI. Please
-            avoid sharing sensitive information.
-          </small>
-        </div>
-        <footer>Ada teaches what no one bothered to make a course for.</footer>
-      </main>
-    );
   return (
     <div className="shell">
+      {accountDialog && (
+        <div className="dialog-backdrop">
+          <section
+            className="dialog account-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="account-title"
+          >
+            <button
+              className="icon-button close"
+              aria-label="Close account dialog"
+              onClick={() => setAccountDialog(false)}
+            >
+              <X size={20} />
+            </button>
+            <h2 id="account-title">
+              {signingIn ? "Welcome back" : "Keep your progress"}
+            </h2>
+            <p>
+              {signingIn
+                ? "Sign in to your existing courses. Your guest course stays in this browser until you sign in; it won’t be added to an existing account."
+                : "Save this course and learn something new anytime. All you need is an email."}
+            </p>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                setBusy(true);
+                setError("");
+                setSent(false);
+                try {
+                  await api("login", {
+                    email,
+                    intent: signingIn ? "signin" : "upgrade",
+                  });
+                  setSent(true);
+                } catch (e) {
+                  setError((e as Error).message);
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              <label htmlFor="account-email">Email address</label>
+              <input
+                id="account-email"
+                type="email"
+                autoComplete="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="you@example.com"
+              />
+              <button className="primary" disabled={busy}>
+                {busy
+                  ? "Sending…"
+                  : sent
+                    ? "Resend email"
+                    : "Continue with email"}
+              </button>
+            </form>
+            {sent && (
+              <p role="status">
+                Check your email and open the newest link in this browser to
+                continue.
+              </p>
+            )}
+            {error && (
+              <p className="error" role="alert">
+                {error}
+              </p>
+            )}
+            <button
+              className="text-button"
+              onClick={() => {
+                setSigningIn(!signingIn);
+                setSent(false);
+                setError("");
+              }}
+            >
+              {signingIn
+                ? "Create an account instead"
+                : "Already have an account? Sign in"}
+            </button>
+          </section>
+        </div>
+      )}
       <Link className="skip-link" href="#main">
         Skip to content
       </Link>
@@ -413,7 +473,14 @@ export default function Ada() {
           <span className="brand-mark">a</span>Ada
           <span className="beta">BETA</span>
         </Link>
-        <button className="new-course" onClick={() => navigate("/app")}>
+        <button
+          className="new-course"
+          onClick={() =>
+            guest && (state.courses.length || state.drafts.length)
+              ? setAccountDialog(true)
+              : navigate("/app")
+          }
+        >
           <Plus size={18} />
           New course
         </button>
@@ -443,11 +510,7 @@ export default function Ada() {
               </Link>
             ))
           ) : (
-            <p className="empty-sidebar">
-              A place for your interests.
-              <br />
-              Your courses will appear here.
-            </p>
+            <p className="empty-sidebar">Your courses will appear here.</p>
           )}
         </nav>
         <div className="sidebar-bottom">
@@ -461,14 +524,18 @@ export default function Ada() {
           </div>
           <button
             className={"profile " + (isSettings ? "active" : "")}
-            onClick={() => navigate("/app/settings")}
+            onClick={() =>
+              guest ? setAccountDialog(true) : navigate("/app/settings")
+            }
           >
             <span className="avatar">
               {state.preferences.displayName?.[0]?.toUpperCase() || "Y"}
             </span>
             <span>
-              {state.preferences.displayName || "Your learning space"}
-              <small>Personal account</small>
+              {guest
+                ? "Create an account"
+                : state.preferences.displayName || "Your account"}
+              <small>{guest ? "Save your progress" : "Settings"}</small>
             </span>
             <Settings size={16} />
           </button>
@@ -492,20 +559,28 @@ export default function Ada() {
             ) : isSettings ? (
               "Your preferences"
             ) : isSetup ? (
-              "A new beginning"
+              "New course"
             ) : isReview ? (
-              "A little recall"
+              "Review"
             ) : (
-              "Your learning space"
+              "Ada"
             )}
           </span>
           <div className="top-right">
+            {guest && (
+              <button
+                className="primary"
+                onClick={() => setAccountDialog(true)}
+              >
+                {state.courses.length ? "Save progress" : "Sign up"}
+              </button>
+            )}
             {mode.mock ? (
               <span className="dev-label">Local fake model</span>
             ) : (
               <span className="ai-label">
                 <i />
-                Your curiosity, a little further
+                Ada
               </span>
             )}
           </div>
@@ -523,6 +598,28 @@ export default function Ada() {
           className={course ? "course-main" : "main"}
           tabIndex={-1}
         >
+          {params.get("error") && (
+            <div className="error global-error" role="alert">
+              That email link has expired or could not be verified.{" "}
+              <button
+                className="text-button"
+                onClick={() => setAccountDialog(true)}
+              >
+                Send a new link
+              </button>
+            </div>
+          )}
+          {guest && course && (
+            <div className="guest-notice">
+              Guest course · Add your email to keep access across devices.{" "}
+              <button
+                className="text-button"
+                onClick={() => setAccountDialog(true)}
+              >
+                Save progress
+              </button>
+            </div>
+          )}
           {error && (
             <div className="error global-error" role="alert">
               {error}
@@ -531,7 +628,7 @@ export default function Ada() {
                 onClick={() => {
                   api("state")
                     .then((d) => {
-                      setState(d.state);
+                      applyState(d.state);
                       setError("");
                     })
                     .catch(() =>
@@ -556,7 +653,7 @@ export default function Ada() {
                 <br className="desktop-break" /> to learn?
               </h1>
               <p className="home-subtitle">
-                A passing thought. A big ambition. A question that won’t leave.
+                Your first course starts with a question.
               </p>
               <form className="topic-form" onSubmit={startTopic}>
                 <input
@@ -564,7 +661,7 @@ export default function Ada() {
                   value={input}
                   maxLength={500}
                   onChange={(e) => setInput(e.target.value)}
-                  placeholder="I’ve always wondered about…"
+                  placeholder="Ask about anything"
                   required
                 />
                 <button
@@ -576,10 +673,10 @@ export default function Ada() {
                 </button>
               </form>
               <p className="form-note">
-                We’ll find a starting point, together.
-                <span>
-                  {input.length ? `${input.length}/500` : "No syllabus needed."}
-                </span>
+                {guest
+                  ? "Try one course. No account needed."
+                  : "Learn at your own pace."}
+                <span>{input.length ? `${input.length}/500` : ""}</span>
               </p>
               <div className="suggestions">
                 <span>NOT SURE? FOLLOW A THREAD</span>
@@ -656,9 +753,7 @@ export default function Ada() {
                 <p>Choose a topic to start a course.</p>
               ) : (
                 <>
-                  <span className="eyebrow">
-                    LET’S FIND YOUR STARTING POINT
-                  </span>
+                  <span className="eyebrow">YOUR COURSE</span>
                   <h1>{draft.topic}</h1>
                   <div className="conversation">
                     {draft.answers.map((a, i) => (
@@ -672,14 +767,14 @@ export default function Ada() {
                       <div className="ada-message">
                         <span className="ada-avatar">a</span>
                         <div>
-                          <h2>A path to begin with.</h2>
+                          <h2>Your course outline</h2>
                           <p>{draft.proposal.direction}</p>
                         </div>
                       </div>
                       <div className="starting-path">
                         <div className="path-heading">
-                          <span>YOUR STARTING PATH</span>
-                          <span>Adaptable, always</span>
+                          <span>OUTLINE</span>
+                          <span>Adapts as you learn</span>
                         </div>
                         {draft.proposal.concepts.map((c, i) => (
                           <div className="path-row" key={c.slug}>
@@ -1004,11 +1099,8 @@ export default function Ada() {
                           <Compass size={27} strokeWidth={1.3} />
                         </span>
                         <span className="eyebrow">ONE IDEA AT A TIME</span>
-                        <h2>Let’s see where you are.</h2>
-                        <p>
-                          We’ll begin with a small question, then build on what
-                          you know. This path will change as you learn.
-                        </p>
+                        <h2>Ready to begin?</h2>
+                        <p>Start with a question. Build on what you know.</p>
                         <button
                           className="primary"
                           disabled={busy}
@@ -1239,7 +1331,7 @@ export default function Ada() {
                 )}
                 {tab === "outline" && (
                   <section className="outline">
-                    <span className="eyebrow">A MAP, NOT A CHECKLIST</span>
+                    <span className="eyebrow">COURSE OUTLINE</span>
                     <h2>Your path, so far.</h2>
                     <p className="muted">
                       A provisional outline. We’ll adapt it as your
@@ -1418,9 +1510,9 @@ export default function Ada() {
               </div>
             </>
           )}
-          {isSettings && (
+          {isSettings && !guest && (
             <section className="reading settings">
-              <span className="eyebrow">MAKE YOURSELF AT HOME</span>
+              <span className="eyebrow">SETTINGS</span>
               <h1>Your preferences</h1>
               <form
                 onSubmit={async (e) => {
@@ -1488,8 +1580,9 @@ export default function Ada() {
                   onClick={async () => {
                     await api("logout", {});
                     clearCachedAnswers();
-                    setLoggedIn(false);
-                    navigate("/login");
+                    setGuest(true);
+                    applyState(empty);
+                    navigate("/app");
                   }}
                 >
                   <LogOut size={15} />
@@ -1513,7 +1606,9 @@ export default function Ada() {
                       try {
                         await api("delete-account", {});
                         clearCachedAnswers();
-                        setLoggedIn(false);
+                        setGuest(true);
+                        applyState(empty);
+                        navigate("/app");
                       } catch (e) {
                         setError((e as Error).message);
                       }
@@ -1529,7 +1624,7 @@ export default function Ada() {
           {isReview && (
             <section className="reading reviews">
               <span className="eyebrow">MAKE IT STICK</span>
-              <h1>A little recall.</h1>
+              <h1>Review</h1>
               {state.courses.some((c) => due(c).length) ? (
                 state.courses
                   .filter((c) => due(c).length)

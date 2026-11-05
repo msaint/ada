@@ -4,6 +4,18 @@ type ProviderError = { code?: string; status?: number };
 export function signInError(provider: ProviderError) {
   const code = provider.code || "unknown";
   if (
+    code === "email_exists" ||
+    code === "user_already_exists" ||
+    code === "identity_already_exists"
+  ) {
+    return Object.assign(
+      new Error(
+        "This email already has an account. Choose Sign in below to open it.",
+      ),
+      { status: 409, code: "AUTH_EMAIL_EXISTS" },
+    );
+  }
+  if (
     provider.status === 429 ||
     code === "over_email_send_rate_limit" ||
     code === "over_request_rate_limit"

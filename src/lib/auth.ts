@@ -34,7 +34,7 @@ export async function supabase() {
     },
   });
 }
-export async function identity() {
+export async function identity(createGuest = false) {
   if (
     process.env.NODE_ENV === "production" &&
     (process.env.ADA_DEV_AUTH === "true" || process.env.MOCK_MODEL === "true")
@@ -46,14 +46,43 @@ export async function identity() {
     return {
       id: "00000000-0000-4000-8000-000000000001",
       email: "local-demo@ada.test",
+      guest: false,
     };
   const client = await supabase();
   const { data, error } = await client.auth.getUser();
+  if (
+    error &&
+    error.name !== "AuthSessionMissingError" &&
+    error.status !== 401 &&
+    error.status !== 403
+  ) {
+    throw Object.assign(
+      new Error("Unable to verify your session. Please try again."),
+      { status: 503 },
+    );
+  }
+  if (!data.user && createGuest) {
+    const result = await client.auth.signInAnonymously();
+    if (result.error || !result.data.user)
+      throw Object.assign(
+        new Error("We couldn’t start your guest session. Please try again."),
+        { status: 503 },
+      );
+    return {
+      id: result.data.user.id,
+      email: result.data.user.email,
+      guest: true,
+    };
+  }
   if (error || !data.user)
     throw Object.assign(new Error("Please sign in to continue."), {
       status: 401,
     });
-  return { id: data.user.id, email: data.user.email };
+  return {
+    id: data.user.id,
+    email: data.user.email,
+    guest: !!data.user.is_anonymous,
+  };
 }
 
 export function database() {

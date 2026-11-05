@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { identity, supabase, devAuth, mockModel } from "@/lib/auth";
+import { initialState, publicState } from "@/lib/schema";
 import { command, view, exportState } from "@/lib/service";
 import { signInError, signInDiagnostic } from "@/lib/sign-in-error";
 export const runtime = "nodejs";
@@ -41,7 +42,25 @@ function error(e: unknown, requestId: string) {
 export async function GET(req: NextRequest) {
   const requestId = crypto.randomUUID();
   try {
-    const user = await identity();
+    const user = await identity().catch((e) => {
+      if (e.status === 401 && req.nextUrl.pathname.endsWith("/state"))
+        return null;
+      throw e;
+    });
+    if (!user)
+      return NextResponse.json(
+        {
+          state: publicState(initialState()),
+          user: null,
+          mode: { devAuth: false, mock: mockModel() },
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    if (user.guest && req.nextUrl.pathname.endsWith("/export"))
+      throw Object.assign(
+        new Error("Create an account to export your progress."),
+        { status: 403, code: "ACCOUNT_REQUIRED" },
+      );
     if (req.nextUrl.pathname.endsWith("/export"))
       return NextResponse.json(await exportState(user.id), {
         headers: {
@@ -78,22 +97,34 @@ export async function POST(req: NextRequest) {
     if (req.nextUrl.pathname.endsWith("/login")) {
       const email = z.string().email().max(254).parse(body.email);
       const client = await supabase();
-      const { error: e } = await client.auth.signInWithOtp({
-        email,
-        options: { emailRedirectTo: expected + "/auth/callback" },
-      });
+      const { data: current } = await client.auth.getUser();
+      const { error: e } =
+        current.user?.is_anonymous && body.intent !== "signin"
+          ? await client.auth.updateUser(
+              { email },
+              { emailRedirectTo: expected + "/auth/callback" },
+            )
+          : await client.auth.signInWithOtp({
+              email,
+              options: { emailRedirectTo: expected + "/auth/callback" },
+            });
       if (e) {
         console.error(JSON.stringify(signInDiagnostic(e, requestId)));
         throw signInError(e);
       }
       return NextResponse.json({ ok: true });
     }
-    const user = await identity();
+    const user = await identity(req.nextUrl.pathname.endsWith("/command"));
     if (req.nextUrl.pathname.endsWith("/logout")) {
       if (!devAuth()) await (await supabase()).auth.signOut();
       return NextResponse.json({ ok: true });
     }
     if (req.nextUrl.pathname.endsWith("/delete-account")) {
+      if (user.guest)
+        throw Object.assign(new Error("Create an account first."), {
+          status: 403,
+          code: "ACCOUNT_REQUIRED",
+        });
       if (devAuth())
         throw Object.assign(
           new Error(
@@ -107,7 +138,7 @@ export async function POST(req: NextRequest) {
       await client.auth.signOut();
       return NextResponse.json({ ok: true });
     }
-    return NextResponse.json(await command(user.id, body));
+    return NextResponse.json(await command(user.id, body, user.guest));
   } catch (e) {
     return error(e, requestId);
   }
